@@ -39,6 +39,7 @@ const (
 // getPodDefinition fills out a Pod definition based on
 // information from the test
 func getPodDefinition(configMapName string, test v1alpha3.TestConfiguration, r PodTestRunner) *v1.Pod {
+
 	return &v1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      fmt.Sprintf("scorecard-test-%s", rand.String(4)),

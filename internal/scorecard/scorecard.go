@@ -185,6 +185,14 @@ func (r FakeTestRunner) Cleanup(ctx context.Context) error {
 
 // Cleanup deletes pods and configmap resources from this test run
 func (r PodTestRunner) Cleanup(ctx context.Context) (err error) {
+
+	// jeff cleanup the pvc here if necessary
+	pvcName := r.configMapName
+	err = r.deletePVC(ctx, pvcName)
+	if err != nil {
+		return err
+	}
+
 	err = r.deletePods(ctx, r.configMapName)
 	if err != nil {
 		return err
@@ -198,8 +206,20 @@ func (r PodTestRunner) Cleanup(ctx context.Context) (err error) {
 
 // RunTest executes a single test
 func (r PodTestRunner) RunTest(ctx context.Context, test v1alpha3.TestConfiguration) (*v1alpha3.TestStatus, error) {
+
 	// Create a Pod to run the test
 	podDef := getPodDefinition(r.configMapName, test, r)
+
+	fmt.Printf("jeff here is the test config at this point %+v\n", test)
+	if test.Labels[STORAGE_PROVISION_LABEL] == "true" {
+		pvcName := r.configMapName
+		err := r.createStorage(ctx, pvcName, test.Labels)
+		if err != nil {
+			return nil, err
+		}
+		addStorageToPod(podDef, pvcName)
+	}
+
 	pod, err := r.Client.CoreV1().Pods(r.Namespace).Create(ctx, podDef, metav1.CreateOptions{})
 	if err != nil {
 		return nil, err
