@@ -18,89 +18,84 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/apimachinery/pkg/util/rand"
+	"k8s.io/apimachinery/pkg/util/wait"
 
 	v1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
-	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/remotecommand"
 	"k8s.io/kubectl/pkg/scheme"
 )
 
 const (
-	STORAGE_PROVISION_LABEL = "storage-provision"
-	STORAGE_SIZE_LABEL      = "storage-size"
-	STORAGE_SIZE_DEFAULT    = "1Gi"
-	STORAGE_MOUNT_LABEL     = "storage-mount"
-	STORAGE_CLASS_LABEL     = "storage-class"
+	STORAGE_PROVISION_LABEL  = "storage"
+	STORAGE_SIZE_LABEL       = "storage-size"
+	STORAGE_ACCESSMODE_LABEL = "storage-accessmode"
+	STORAGE_SIZE_DEFAULT     = "1Gi"
+	STORAGE_MOUNT_LABEL      = "storage-mount"
+	STORAGE_CLASS_LABEL      = "storage-class"
 )
 
-func (r PodTestRunner) createStorage(ctx context.Context, pvcName string, labels map[string]string) (err error) {
+func (r PodTestRunner) createStorage(ctx context.Context, labels map[string]string) (pvcName string, err error) {
+	pvcName = fmt.Sprintf("scorecard-pvc-%s", rand.String(4))
 	fmt.Printf("STORAGE..creating PVC [%s]\n", pvcName)
 	fmt.Printf("storage-provision [%s]\n", labels[STORAGE_PROVISION_LABEL])
 	fmt.Printf("storage-size [%s]\n", labels[STORAGE_SIZE_LABEL])
 	fmt.Printf("storage-mount [%s]\n", labels[STORAGE_MOUNT_LABEL])
 	fmt.Printf("storage-class [%s]\n", labels[STORAGE_CLASS_LABEL])
+	accessModeEntered := labels[STORAGE_ACCESSMODE_LABEL]
+
 	pvcSize := STORAGE_SIZE_DEFAULT
 	if pvcSize != "" {
 		pvcSize = labels[STORAGE_SIZE_LABEL]
 	}
 	storageClassName, err := r.findDefaultStorageClassName()
 	if err != nil {
-		return err
+		return "", err
 	}
 	if labels[STORAGE_CLASS_LABEL] != "" {
 		storageClassName = labels[STORAGE_CLASS_LABEL]
 	}
-	pvcDef, err := r.getPVCDefinition(pvcName, pvcSize, storageClassName)
+	pvcDef, err := r.getPVCDefinition(r.configMapName, pvcName, pvcSize, storageClassName, accessModeEntered)
 	if err != nil {
-		return err
+		return "", err
 	}
 	fmt.Printf("would have created this pvc %+v\n", pvcDef)
 
 	pvc, err := r.Client.CoreV1().PersistentVolumeClaims(r.Namespace).Create(ctx, pvcDef, metav1.CreateOptions{})
 	if err != nil {
-		return err
+		return "", err
 	}
 	fmt.Printf("created pvc %s!\n", pvc.Name)
 
-	return nil
+	return pvcName, nil
 }
 
-func execInPod(config *rest.Config, namespace, podName, command, containerName string) (io.Reader, error) {
-	k8sCli, err := kubernetes.NewForConfig(config)
-	if err != nil {
-		return nil, err
-	}
-	/**
-	cmd := []string{
-		"sh",
-		"-c",
-		command,
-	}
-	*/
+func (r PodTestRunner) execInPod(podName, mountPath, containerName string) (io.Reader, error) {
 	cmd := []string{
 		"tar",
 		"cf",
 		"-",
-		command,
+		mountPath,
 	}
 
 	reader, outStream := io.Pipe()
 	const tty = false
-	req := k8sCli.CoreV1().RESTClient().Post().
+	req := r.Client.CoreV1().RESTClient().Post().
 		Resource("pods").
 		Name(podName).
-		Namespace(namespace).SubResource("exec").Param("container", containerName)
+		Namespace(r.Namespace).SubResource("exec").Param("container", containerName)
 	req.VersionedParams(
 		&v1.PodExecOptions{
 			Command: cmd,
@@ -114,7 +109,7 @@ func execInPod(config *rest.Config, namespace, podName, command, containerName s
 
 	fmt.Printf("URL %s\n", req.URL().String())
 	var stderr bytes.Buffer
-	exec, err := remotecommand.NewSPDYExecutor(config, "POST", req.URL())
+	exec, err := remotecommand.NewSPDYExecutor(r.RESTConfig, "POST", req.URL())
 	if err != nil {
 		return nil, err
 	}
@@ -134,7 +129,7 @@ func execInPod(config *rest.Config, namespace, podName, command, containerName s
 	return reader, err
 }
 
-func getPrefix(file string) string {
+func getStoragePrefix(file string) string {
 	return strings.TrimLeft(file, "/")
 }
 func untarAll(reader io.Reader, destDir, prefix string) error {
@@ -229,22 +224,36 @@ func findStorageClass(scList *storagev1.StorageClassList, scName string) bool {
 	return false
 }
 
-func (r PodTestRunner) deletePVC(ctx context.Context, configMapName string) error {
-	fmt.Printf("jeff cleanup pvc on %s\n", configMapName)
-	err := r.Client.CoreV1().PersistentVolumeClaims(r.Namespace).Delete(ctx, configMapName, metav1.DeleteOptions{})
-	if err != nil && kerrors.IsNotFound(err) {
-		fmt.Printf("jeff cleanup pvc but its not found\n")
-		return nil
-	}
+func (r PodTestRunner) deletePVCs(ctx context.Context) error {
+	selector := fmt.Sprintf("testrun=%s", r.configMapName)
+	listOptions := metav1.ListOptions{LabelSelector: selector}
+	err := r.Client.CoreV1().PersistentVolumeClaims(r.Namespace).DeleteCollection(ctx, metav1.DeleteOptions{}, listOptions)
 	if err != nil {
-		return fmt.Errorf("error deleting PVC %s %w", configMapName, err)
+		return fmt.Errorf("error deleting PVCs (label selector %q): %w", selector, err)
 	}
-	fmt.Printf("jeff cleanup pvc on %s\n successful", configMapName)
+	fmt.Printf("jeff cleanup pvc on %s\n successful", r.configMapName)
 	return nil
 }
 
-func (r PodTestRunner) getPVCDefinition(pvcName, pvcSize, storageClassName string) (value *v1.PersistentVolumeClaim, err error) {
-	qtyString := "100Mi"
+func (r PodTestRunner) getPVCDefinition(configMapName, pvcName, pvcSize, storageClassName, accessModeSupplied string) (value *v1.PersistentVolumeClaim, err error) {
+
+	accessMode := v1.ReadWriteOnce
+
+	switch accessModeSupplied {
+	case "":
+	case "ReadWriteOnce":
+		break
+	case "ReadOnlyMany":
+		accessMode = v1.ReadOnlyMany
+		break
+	case "ReadWriteMany":
+		accessMode = v1.ReadWriteMany
+		break
+	default:
+		return nil, errors.New("invalid storage accessmode, valid values are: ReadOnlyMany, ReadWriteMany, ReadWriteOnce")
+	}
+
+	qtyString := "1Gi"
 	q, err := resource.ParseQuantity(qtyString)
 	if err != nil {
 		return nil, err
@@ -261,11 +270,11 @@ func (r PodTestRunner) getPVCDefinition(pvcName, pvcSize, storageClassName strin
 			Namespace: r.Namespace,
 			Labels: map[string]string{
 				"app":     "scorecard-test",
-				"testrun": pvcName,
+				"testrun": configMapName,
 			},
 		},
 		Spec: v1.PersistentVolumeClaimSpec{
-			AccessModes:      []v1.PersistentVolumeAccessMode{v1.ReadWriteOnce},
+			AccessModes:      []v1.PersistentVolumeAccessMode{accessMode},
 			Resources:        resources,
 			StorageClassName: &storageClassName,
 		},
@@ -289,5 +298,113 @@ func addStorageToPod(podDef *v1.Pod, pvcName string) {
 	newVolume.PersistentVolumeClaim.ReadOnly = false
 
 	podDef.Spec.Volumes = append(podDef.Spec.Volumes, newVolume)
+
+}
+
+func getGatherPodDefinition(podName, pvcName string, r PodTestRunner) *v1.Pod {
+
+	return &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      podName,
+			Namespace: r.Namespace,
+			Labels: map[string]string{
+				"app":     "scorecard-gather",
+				"testrun": r.configMapName,
+			},
+		},
+		Spec: v1.PodSpec{
+			ServiceAccountName: r.ServiceAccount,
+			RestartPolicy:      v1.RestartPolicyNever,
+			Containers: []v1.Container{
+				{
+					Name:            "scorecard-gather",
+					Image:           "busybox",
+					ImagePullPolicy: v1.PullIfNotPresent,
+					Args: []string{
+						"sleep",
+						"1000",
+					},
+					VolumeMounts: []v1.VolumeMount{
+						{
+							MountPath: "/test-output",
+							Name:      "test-output",
+							ReadOnly:  true,
+						},
+					},
+				},
+			},
+			Volumes: []v1.Volume{
+				{
+					Name: "test-output",
+					VolumeSource: v1.VolumeSource{
+						PersistentVolumeClaim: &v1.PersistentVolumeClaimVolumeSource{
+							ClaimName: pvcName,
+							ReadOnly:  true,
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
+func gatherTestOutput(ctx context.Context, r PodTestRunner, testName, pvcName string) error {
+	// use the pvcName, being unique, as the pod name which needs to be unique
+	podName := fmt.Sprintf("scorecard-gather-%s", rand.String(4))
+	podDef := getGatherPodDefinition(podName, pvcName, r)
+	pod, err := r.Client.CoreV1().Pods(r.Namespace).Create(ctx, podDef, metav1.CreateOptions{})
+	if err != nil {
+		fmt.Printf("jeff error %s\n", err.Error())
+		return err
+	}
+	fmt.Printf("jeff gathering test output pod %s in ns %s outputdir %s testName %s pvcName %s\n", pod.ObjectMeta.Name, r.Namespace, r.TestOutput, testName, pvcName)
+
+	// wait for the gather pod to be in Running state so we can exec into it
+	err = r.waitForTestToRun(ctx, pod)
+	if err != nil {
+		fmt.Printf("jeff waitfor error %s\n", err.Error())
+		return err
+	}
+
+	//exec into pod, run tar,  get reader
+	mountPath := "/tmp"
+	containerName := "scorecard-gather"
+	reader, err := r.execInPod(podName, mountPath, containerName)
+	if err != nil {
+		fmt.Printf("jeff exec error %s\n", err.Error())
+		return err
+	}
+
+	srcPath := "/tmp"
+	prefix := getStoragePrefix(srcPath)
+	prefix = path.Clean(prefix)
+	destPath := r.TestOutput
+	err = untarAll(reader, destPath, prefix)
+	if err != nil {
+		fmt.Printf("jeff error %s\n", err.Error())
+		return err
+	}
+
+	return nil
+}
+
+// waitForTestToRun waits for a fixed amount of time while
+// checking for a test pod to be in a Running state
+func (r PodTestRunner) waitForTestToRun(ctx context.Context, p *v1.Pod) (err error) {
+
+	podCheck := wait.ConditionFunc(func() (done bool, err error) {
+		var tmp *v1.Pod
+		tmp, err = r.Client.CoreV1().Pods(p.Namespace).Get(ctx, p.Name, metav1.GetOptions{})
+		if err != nil {
+			return true, fmt.Errorf("error getting pod %s %w", p.Name, err)
+		}
+		if tmp.Status.Phase == v1.PodRunning {
+			return true, nil
+		}
+		return false, nil
+	})
+
+	err = wait.PollImmediateUntil(1*time.Second, podCheck, ctx.Done())
+	return err
 
 }

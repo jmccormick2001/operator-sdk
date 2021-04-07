@@ -26,6 +26,7 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 
 	registryutil "github.com/operator-framework/operator-sdk/internal/registry"
 )
@@ -47,8 +48,10 @@ type PodTestRunner struct {
 	Namespace      string
 	ServiceAccount string
 	BundlePath     string
+	TestOutput     string
 	BundleMetadata registryutil.Labels
 	Client         kubernetes.Interface
+	RESTConfig     *rest.Config
 
 	configMapName string
 }
@@ -170,6 +173,7 @@ func (r *PodTestRunner) Initialize(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("error creating ConfigMap %w", err)
 	}
+
 	return nil
 
 }
@@ -186,13 +190,6 @@ func (r FakeTestRunner) Cleanup(ctx context.Context) error {
 // Cleanup deletes pods and configmap resources from this test run
 func (r PodTestRunner) Cleanup(ctx context.Context) (err error) {
 
-	// jeff cleanup the pvc here if necessary
-	pvcName := r.configMapName
-	err = r.deletePVC(ctx, pvcName)
-	if err != nil {
-		return err
-	}
-
 	err = r.deletePods(ctx, r.configMapName)
 	if err != nil {
 		return err
@@ -201,6 +198,12 @@ func (r PodTestRunner) Cleanup(ctx context.Context) (err error) {
 	if err != nil {
 		return err
 	}
+
+	err = r.deletePVCs(ctx)
+	if err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -211,9 +214,10 @@ func (r PodTestRunner) RunTest(ctx context.Context, test v1alpha3.TestConfigurat
 	podDef := getPodDefinition(r.configMapName, test, r)
 
 	fmt.Printf("jeff here is the test config at this point %+v\n", test)
+	var pvcName string
 	if test.Labels[STORAGE_PROVISION_LABEL] == "true" {
-		pvcName := r.configMapName
-		err := r.createStorage(ctx, pvcName, test.Labels)
+		var err error
+		pvcName, err = r.createStorage(ctx, test.Labels)
 		if err != nil {
 			return nil, err
 		}
@@ -228,6 +232,15 @@ func (r PodTestRunner) RunTest(ctx context.Context, test v1alpha3.TestConfigurat
 	err = r.waitForTestToComplete(ctx, pod)
 	if err != nil {
 		return nil, err
+	}
+
+	// gather test output if necessary
+	if test.Labels[STORAGE_PROVISION_LABEL] == "true" {
+		testName := test.Labels["suite"] + "." + test.Labels["test"]
+		err := gatherTestOutput(ctx, r, testName, pvcName)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	return r.getTestStatus(ctx, pod), nil
