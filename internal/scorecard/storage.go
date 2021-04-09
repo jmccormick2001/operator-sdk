@@ -31,6 +31,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/rand"
 	"k8s.io/apimachinery/pkg/util/wait"
 
+	log "github.com/sirupsen/logrus"
 	v1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -39,21 +40,18 @@ import (
 )
 
 const (
-	STORAGE_PROVISION_LABEL  = "storage"
-	STORAGE_SIZE_LABEL       = "storage-size"
-	STORAGE_ACCESSMODE_LABEL = "storage-accessmode"
-	STORAGE_SIZE_DEFAULT     = "1Gi"
-	STORAGE_MOUNT_LABEL      = "storage-mount"
-	STORAGE_CLASS_LABEL      = "storage-class"
+	STORAGE_PROVISION_LABEL    = "storage"
+	STORAGE_SIZE_LABEL         = "storage-size"
+	STORAGE_ACCESSMODE_LABEL   = "storage-accessmode"
+	STORAGE_SIZE_DEFAULT       = "1Gi"
+	STORAGE_MOUNT_LABEL        = "storage-mount"
+	STORAGE_CLASS_LABEL        = "storage-class"
+	STORAGE_DEFAULT_MOUNT      = "/test-output"
+	STORAGE_DEFAULT_ACCESSMODE = v1.ReadWriteOnce
 )
 
 func (r PodTestRunner) createStorage(ctx context.Context, labels map[string]string) (pvcName string, err error) {
 	pvcName = fmt.Sprintf("scorecard-pvc-%s", rand.String(4))
-	fmt.Printf("STORAGE..creating PVC [%s]\n", pvcName)
-	fmt.Printf("storage-provision [%s]\n", labels[STORAGE_PROVISION_LABEL])
-	fmt.Printf("storage-size [%s]\n", labels[STORAGE_SIZE_LABEL])
-	fmt.Printf("storage-mount [%s]\n", labels[STORAGE_MOUNT_LABEL])
-	fmt.Printf("storage-class [%s]\n", labels[STORAGE_CLASS_LABEL])
 	accessModeEntered := labels[STORAGE_ACCESSMODE_LABEL]
 
 	pvcSize := STORAGE_SIZE_DEFAULT
@@ -71,13 +69,11 @@ func (r PodTestRunner) createStorage(ctx context.Context, labels map[string]stri
 	if err != nil {
 		return "", err
 	}
-	fmt.Printf("would have created this pvc %+v\n", pvcDef)
 
-	pvc, err := r.Client.CoreV1().PersistentVolumeClaims(r.Namespace).Create(ctx, pvcDef, metav1.CreateOptions{})
+	_, err = r.Client.CoreV1().PersistentVolumeClaims(r.Namespace).Create(ctx, pvcDef, metav1.CreateOptions{})
 	if err != nil {
 		return "", err
 	}
-	fmt.Printf("created pvc %s!\n", pvc.Name)
 
 	return pvcName, nil
 }
@@ -107,7 +103,6 @@ func (r PodTestRunner) execInPod(podName, mountPath, containerName string) (io.R
 		scheme.ParameterCodec,
 	)
 
-	fmt.Printf("URL %s\n", req.URL().String())
 	var stderr bytes.Buffer
 	exec, err := remotecommand.NewSPDYExecutor(r.RESTConfig, "POST", req.URL())
 	if err != nil {
@@ -117,13 +112,12 @@ func (r PodTestRunner) execInPod(podName, mountPath, containerName string) (io.R
 	go func() {
 		defer outStream.Close()
 		err = exec.Stream(remotecommand.StreamOptions{
-			Stdin: nil,
-			//Stdout: &stdout,
+			Stdin:  nil,
 			Stdout: outStream,
 			Stderr: &stderr,
 		})
 		if err != nil {
-			fmt.Printf("error in stream %s\n", err.Error())
+			log.Error(err)
 		}
 	}()
 	return reader, err
@@ -132,6 +126,7 @@ func (r PodTestRunner) execInPod(podName, mountPath, containerName string) (io.R
 func getStoragePrefix(file string) string {
 	return strings.TrimLeft(file, "/")
 }
+
 func untarAll(reader io.Reader, destDir, prefix string) error {
 	tarReader := tar.NewReader(reader)
 	for {
@@ -199,14 +194,9 @@ func (r PodTestRunner) findDefaultStorageClassName() (defaultStorageClassName st
 	if err != nil {
 		return "", err
 	}
-	for _, sc := range storageClasses.Items {
-		fmt.Printf("storageClasses %+s\n", sc.Name)
-	}
 
 	for _, sc := range storageClasses.Items {
-		fmt.Printf("storageClasses %+s meta annotations %+v\n", sc.Name, sc.ObjectMeta.Annotations)
 		if sc.ObjectMeta.Annotations["storageclass.kubernetes.io/is-default-class"] == "true" {
-			fmt.Printf("this one %s is the default storage class\n", sc.Name)
 			return sc.Name, nil
 		}
 
@@ -231,13 +221,12 @@ func (r PodTestRunner) deletePVCs(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("error deleting PVCs (label selector %q): %w", selector, err)
 	}
-	fmt.Printf("jeff cleanup pvc on %s\n successful", r.configMapName)
 	return nil
 }
 
 func (r PodTestRunner) getPVCDefinition(configMapName, pvcName, pvcSize, storageClassName, accessModeSupplied string) (value *v1.PersistentVolumeClaim, err error) {
 
-	accessMode := v1.ReadWriteOnce
+	accessMode := STORAGE_DEFAULT_ACCESSMODE
 
 	switch accessModeSupplied {
 	case "":
@@ -253,7 +242,7 @@ func (r PodTestRunner) getPVCDefinition(configMapName, pvcName, pvcSize, storage
 		return nil, errors.New("invalid storage accessmode, valid values are: ReadOnlyMany, ReadWriteMany, ReadWriteOnce")
 	}
 
-	qtyString := "1Gi"
+	qtyString := STORAGE_SIZE_DEFAULT
 	q, err := resource.ParseQuantity(qtyString)
 	if err != nil {
 		return nil, err
@@ -262,7 +251,6 @@ func (r PodTestRunner) getPVCDefinition(configMapName, pvcName, pvcSize, storage
 	resources := v1.ResourceRequirements{}
 	resources.Requests = v1.ResourceList{}
 	resources.Requests["storage"] = q
-	//storage: 100Mi
 
 	value = &v1.PersistentVolumeClaim{
 		ObjectMeta: metav1.ObjectMeta{
@@ -284,14 +272,14 @@ func (r PodTestRunner) getPVCDefinition(configMapName, pvcName, pvcSize, storage
 
 func addStorageToPod(podDef *v1.Pod, pvcName string) {
 	vMount := v1.VolumeMount{
-		MountPath: "/somestorage",
-		Name:      "somestorage",
+		MountPath: STORAGE_DEFAULT_MOUNT,
+		Name:      "scorecardstorage",
 		ReadOnly:  false,
 	}
 	podDef.Spec.Containers[0].VolumeMounts = append(podDef.Spec.Containers[0].VolumeMounts, vMount)
 
 	newVolume := v1.Volume{}
-	newVolume.Name = "somestorage"
+	newVolume.Name = "scorecardstorage"
 	newVolume.VolumeSource = v1.VolumeSource{}
 	newVolume.PersistentVolumeClaim = &v1.PersistentVolumeClaimVolumeSource{}
 	newVolume.PersistentVolumeClaim.ClaimName = pvcName
@@ -322,11 +310,11 @@ func getGatherPodDefinition(podName, pvcName string, r PodTestRunner) *v1.Pod {
 					ImagePullPolicy: v1.PullIfNotPresent,
 					Args: []string{
 						"sleep",
-						"1000",
+						"300",
 					},
 					VolumeMounts: []v1.VolumeMount{
 						{
-							MountPath: "/test-output",
+							MountPath: STORAGE_DEFAULT_MOUNT,
 							Name:      "test-output",
 							ReadOnly:  true,
 						},
@@ -348,40 +336,38 @@ func getGatherPodDefinition(podName, pvcName string, r PodTestRunner) *v1.Pod {
 	}
 }
 
-func gatherTestOutput(ctx context.Context, r PodTestRunner, testName, pvcName string) error {
+func gatherTestOutput(ctx context.Context, r PodTestRunner, suiteName, testName, pvcName string) error {
 	// use the pvcName, being unique, as the pod name which needs to be unique
 	podName := fmt.Sprintf("scorecard-gather-%s", rand.String(4))
 	podDef := getGatherPodDefinition(podName, pvcName, r)
 	pod, err := r.Client.CoreV1().Pods(r.Namespace).Create(ctx, podDef, metav1.CreateOptions{})
 	if err != nil {
-		fmt.Printf("jeff error %s\n", err.Error())
 		return err
 	}
-	fmt.Printf("jeff gathering test output pod %s in ns %s outputdir %s testName %s pvcName %s\n", pod.ObjectMeta.Name, r.Namespace, r.TestOutput, testName, pvcName)
+
+	//fmt.Printf("gathering test output pod %s in ns %s outputdir %s testName %s pvcName %s\n", pod.ObjectMeta.Name, r.Namespace, r.TestOutput, testName, pvcName)
 
 	// wait for the gather pod to be in Running state so we can exec into it
 	err = r.waitForTestToRun(ctx, pod)
 	if err != nil {
-		fmt.Printf("jeff waitfor error %s\n", err.Error())
 		return err
 	}
 
 	//exec into pod, run tar,  get reader
-	mountPath := "/tmp"
+	mountPath := STORAGE_DEFAULT_MOUNT
 	containerName := "scorecard-gather"
 	reader, err := r.execInPod(podName, mountPath, containerName)
 	if err != nil {
-		fmt.Printf("jeff exec error %s\n", err.Error())
 		return err
 	}
 
-	srcPath := "/tmp"
+	srcPath := r.TestOutput
 	prefix := getStoragePrefix(srcPath)
 	prefix = path.Clean(prefix)
-	destPath := r.TestOutput
+	destPath := getDestPath(r.TestOutput, suiteName, testName)
+	fmt.Printf("destPath becomes %s\n", destPath)
 	err = untarAll(reader, destPath, prefix)
 	if err != nil {
-		fmt.Printf("jeff error %s\n", err.Error())
 		return err
 	}
 
@@ -407,4 +393,13 @@ func (r PodTestRunner) waitForTestToRun(ctx context.Context, p *v1.Pod) (err err
 	err = wait.PollImmediateUntil(1*time.Second, podCheck, ctx.Done())
 	return err
 
+}
+
+func getDestPath(baseDir, suiteName, testName string) (destPath string) {
+	destPath = baseDir + string(os.PathSeparator)
+	if suiteName != "" {
+		destPath = destPath + suiteName + string(os.PathSeparator)
+	}
+	destPath = destPath + testName
+	return destPath
 }

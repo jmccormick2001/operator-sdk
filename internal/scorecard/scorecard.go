@@ -198,7 +198,6 @@ func (r PodTestRunner) Cleanup(ctx context.Context) (err error) {
 	if err != nil {
 		return err
 	}
-
 	err = r.deletePVCs(ctx)
 	if err != nil {
 		return err
@@ -213,7 +212,6 @@ func (r PodTestRunner) RunTest(ctx context.Context, test v1alpha3.TestConfigurat
 	// Create a Pod to run the test
 	podDef := getPodDefinition(r.configMapName, test, r)
 
-	fmt.Printf("jeff here is the test config at this point %+v\n", test)
 	var pvcName string
 	if test.Labels[STORAGE_PROVISION_LABEL] == "true" {
 		var err error
@@ -236,8 +234,7 @@ func (r PodTestRunner) RunTest(ctx context.Context, test v1alpha3.TestConfigurat
 
 	// gather test output if necessary
 	if test.Labels[STORAGE_PROVISION_LABEL] == "true" {
-		testName := test.Labels["suite"] + "." + test.Labels["test"]
-		err := gatherTestOutput(ctx, r, testName, pvcName)
+		err := gatherTestOutput(ctx, r, test.Labels["suite"], test.Labels["test"], pvcName)
 		if err != nil {
 			return nil, err
 		}
