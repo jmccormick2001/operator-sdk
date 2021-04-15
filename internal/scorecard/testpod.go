@@ -127,7 +127,11 @@ func getPodDefinition(configMapName string, test v1alpha3.TestConfiguration, r P
 
 // getPodLog fetches the test results which are found in the pod log
 func getPodLog(ctx context.Context, client kubernetes.Interface, pod *v1.Pod) ([]byte, error) {
-	req := client.CoreV1().Pods(pod.Namespace).GetLogs(pod.Name, &v1.PodLogOptions{})
+	podLogOptions := v1.PodLogOptions{
+		Container: "scorecard-test",
+	}
+
+	req := client.CoreV1().Pods(pod.Namespace).GetLogs(pod.Name, &podLogOptions)
 	podLogs, err := req.Stream(ctx)
 	if err != nil {
 		return nil, err

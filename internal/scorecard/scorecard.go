@@ -198,10 +198,6 @@ func (r PodTestRunner) Cleanup(ctx context.Context) (err error) {
 	if err != nil {
 		return err
 	}
-	err = r.deletePVCs(ctx)
-	if err != nil {
-		return err
-	}
 
 	return nil
 }
@@ -212,14 +208,8 @@ func (r PodTestRunner) RunTest(ctx context.Context, test v1alpha3.TestConfigurat
 	// Create a Pod to run the test
 	podDef := getPodDefinition(r.configMapName, test, r)
 
-	var pvcName string
 	if test.Labels[STORAGE_PROVISION_LABEL] == "true" {
-		var err error
-		pvcName, err = r.createStorage(ctx, test.Labels)
-		if err != nil {
-			return nil, err
-		}
-		addStorageToPod(podDef, pvcName)
+		addStorageToPod(podDef)
 	}
 
 	pod, err := r.Client.CoreV1().Pods(r.Namespace).Create(ctx, podDef, metav1.CreateOptions{})
@@ -234,8 +224,9 @@ func (r PodTestRunner) RunTest(ctx context.Context, test v1alpha3.TestConfigurat
 
 	// gather test output if necessary
 	if test.Labels[STORAGE_PROVISION_LABEL] == "true" {
-		err := gatherTestOutput(ctx, r, test.Labels["suite"], test.Labels["test"], pvcName)
+		err := gatherTestOutput(ctx, r, test.Labels["suite"], test.Labels["test"], pod.Name)
 		if err != nil {
+			fmt.Printf("jeff error in gatherTestOutput %s\n", err.Error())
 			return nil, err
 		}
 	}
@@ -267,9 +258,25 @@ func (r PodTestRunner) waitForTestToComplete(ctx context.Context, p *v1.Pod) (er
 		if err != nil {
 			return true, fmt.Errorf("error getting pod %s %w", p.Name, err)
 		}
+		for _, s := range tmp.Status.ContainerStatuses {
+			if s.Name == "scorecard-test" {
+				if s.State.Terminated != nil {
+					fmt.Printf("jeff scorecard test container is terminated\n")
+					return true, nil
+				}
+			}
+		}
+
+		// tmp.Status.ContainerStatuses []ContainerStatus
+		// ContainerStatus.Name
+		// ContainerStatus.State ContainerState
+		// ContainerStatus.State.Running
+		// ContainerStatus.State.Terminated != nil
+		/**
 		if tmp.Status.Phase == v1.PodSucceeded || tmp.Status.Phase == v1.PodFailed {
 			return true, nil
 		}
+		*/
 		return false, nil
 	})
 
