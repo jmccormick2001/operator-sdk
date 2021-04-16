@@ -27,21 +27,12 @@ import (
 
 	log "github.com/sirupsen/logrus"
 	v1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/remotecommand"
 	"k8s.io/kubectl/pkg/scheme"
 )
 
 const (
-	STORAGE_PROVISION_LABEL    = "storage"
-	STORAGE_SIZE_LABEL         = "storage-size"
-	STORAGE_ACCESSMODE_LABEL   = "storage-accessmode"
-	STORAGE_SIZE_DEFAULT       = "1Gi"
-	STORAGE_MOUNT_LABEL        = "storage-mount"
-	STORAGE_CLASS_LABEL        = "storage-class"
-	STORAGE_DEFAULT_MOUNT      = "/test-output"
-	STORAGE_DEFAULT_ACCESSMODE = v1.ReadWriteOnce
-	STORAGE_SIDECAR_CONTAINER  = "scorecard-gather"
+	STORAGE_SIDECAR_CONTAINER = "scorecard-gather"
 )
 
 func (r PodTestRunner) execInPod(podName, mountPath, containerName string) (io.Reader, error) {
@@ -154,7 +145,7 @@ func untarAll(reader io.Reader, destDir, prefix string) error {
 	return nil
 }
 
-func addStorageToPod(podDef *v1.Pod) {
+func addStorageToPod(podDef *v1.Pod, mountPath string) {
 
 	// add the emptyDir volume for storage to the test Pod
 	newVolume := v1.Volume{}
@@ -169,12 +160,14 @@ func addStorageToPod(podDef *v1.Pod) {
 		Image:           "busybox",
 		ImagePullPolicy: v1.PullIfNotPresent,
 		Args: []string{
-			"sleep",
-			"300",
+			"/bin/sh",
+			"-c",
+			//"trap 'echo TERM;exit 0' TERM;tail -f /dev/null",
+			"sleep 1000",
 		},
 		VolumeMounts: []v1.VolumeMount{
 			{
-				MountPath: STORAGE_DEFAULT_MOUNT,
+				MountPath: mountPath,
 				Name:      "scorecard-storage",
 				ReadOnly:  true,
 			},
@@ -186,7 +179,7 @@ func addStorageToPod(podDef *v1.Pod) {
 	// add the storage emptyDir volume into the test container
 
 	vMount := v1.VolumeMount{
-		MountPath: STORAGE_DEFAULT_MOUNT,
+		MountPath: mountPath,
 		Name:      "scorecard-storage",
 		ReadOnly:  false,
 	}
@@ -194,57 +187,9 @@ func addStorageToPod(podDef *v1.Pod) {
 
 }
 
-func getGatherPodDefinition(podName, pvcName string, r PodTestRunner) *v1.Pod {
-
-	return &v1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      podName,
-			Namespace: r.Namespace,
-			Labels: map[string]string{
-				"app":     STORAGE_SIDECAR_CONTAINER,
-				"testrun": r.configMapName,
-			},
-		},
-		Spec: v1.PodSpec{
-			ServiceAccountName: r.ServiceAccount,
-			RestartPolicy:      v1.RestartPolicyNever,
-			Containers: []v1.Container{
-				{
-					Name:            STORAGE_SIDECAR_CONTAINER,
-					Image:           "busybox",
-					ImagePullPolicy: v1.PullIfNotPresent,
-					Args: []string{
-						"sleep",
-						"300",
-					},
-					VolumeMounts: []v1.VolumeMount{
-						{
-							MountPath: STORAGE_DEFAULT_MOUNT,
-							Name:      "test-output",
-							ReadOnly:  true,
-						},
-					},
-				},
-			},
-			Volumes: []v1.Volume{
-				{
-					Name: "test-output",
-					VolumeSource: v1.VolumeSource{
-						PersistentVolumeClaim: &v1.PersistentVolumeClaimVolumeSource{
-							ClaimName: pvcName,
-							ReadOnly:  true,
-						},
-					},
-				},
-			},
-		},
-	}
-}
-
-func gatherTestOutput(ctx context.Context, r PodTestRunner, suiteName, testName, podName string) error {
+func gatherTestOutput(ctx context.Context, r PodTestRunner, suiteName, testName, podName, mountPath string) error {
 
 	//exec into sidecar container, run tar,  get reader
-	mountPath := STORAGE_DEFAULT_MOUNT
 	containerName := STORAGE_SIDECAR_CONTAINER
 	reader, err := r.execInPod(podName, mountPath, containerName)
 	if err != nil {
@@ -255,7 +200,6 @@ func gatherTestOutput(ctx context.Context, r PodTestRunner, suiteName, testName,
 	prefix := getStoragePrefix(srcPath)
 	prefix = path.Clean(prefix)
 	destPath := getDestPath(r.TestOutput, suiteName, testName)
-	fmt.Printf("destPath becomes %s\n", destPath)
 	err = untarAll(reader, destPath, prefix)
 	if err != nil {
 		return err

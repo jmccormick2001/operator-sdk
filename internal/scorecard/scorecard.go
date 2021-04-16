@@ -208,8 +208,8 @@ func (r PodTestRunner) RunTest(ctx context.Context, test v1alpha3.TestConfigurat
 	// Create a Pod to run the test
 	podDef := getPodDefinition(r.configMapName, test, r)
 
-	if test.Labels[STORAGE_PROVISION_LABEL] == "true" {
-		addStorageToPod(podDef)
+	if test.Storage.Spec.MountPath.Path != "" {
+		addStorageToPod(podDef, test.Storage.Spec.MountPath.Path)
 	}
 
 	pod, err := r.Client.CoreV1().Pods(r.Namespace).Create(ctx, podDef, metav1.CreateOptions{})
@@ -223,10 +223,9 @@ func (r PodTestRunner) RunTest(ctx context.Context, test v1alpha3.TestConfigurat
 	}
 
 	// gather test output if necessary
-	if test.Labels[STORAGE_PROVISION_LABEL] == "true" {
-		err := gatherTestOutput(ctx, r, test.Labels["suite"], test.Labels["test"], pod.Name)
+	if test.Storage.Spec.MountPath.Path != "" {
+		err := gatherTestOutput(ctx, r, test.Labels["suite"], test.Labels["test"], pod.Name, test.Storage.Spec.MountPath.Path)
 		if err != nil {
-			fmt.Printf("jeff error in gatherTestOutput %s\n", err.Error())
 			return nil, err
 		}
 	}
@@ -261,22 +260,11 @@ func (r PodTestRunner) waitForTestToComplete(ctx context.Context, p *v1.Pod) (er
 		for _, s := range tmp.Status.ContainerStatuses {
 			if s.Name == "scorecard-test" {
 				if s.State.Terminated != nil {
-					fmt.Printf("jeff scorecard test container is terminated\n")
 					return true, nil
 				}
 			}
 		}
 
-		// tmp.Status.ContainerStatuses []ContainerStatus
-		// ContainerStatus.Name
-		// ContainerStatus.State ContainerState
-		// ContainerStatus.State.Running
-		// ContainerStatus.State.Terminated != nil
-		/**
-		if tmp.Status.Phase == v1.PodSucceeded || tmp.Status.Phase == v1.PodFailed {
-			return true, nil
-		}
-		*/
 		return false, nil
 	})
 
